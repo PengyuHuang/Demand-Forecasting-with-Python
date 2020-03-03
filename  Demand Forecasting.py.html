@@ -1,0 +1,1095 @@
+
+# coding: utf-8
+
+# In[2]:
+
+
+import pandas as pd
+import sklearn.metrics
+import sklearn
+#get_ipython().magic(u'matplotlib inline')
+import matplotlib.pyplot as plt
+import scipy.stats as ss
+import seaborn as sns
+import numpy as np
+from sklearn import preprocessing
+from sklearn.feature_selection import SelectFromModel
+from sklearn.linear_model import LassoCV
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, Lasso
+from sklearn.metrics import mean_squared_error, r2_score
+from math import sqrt
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV
+from sklearn.utils import shuffle
+from sklearn.externals import joblib
+import collections
+#import lightgbm as lgbm
+
+
+# # 1. Exploratory data analyses (EDA)
+# * Historical_sales is the weekly historical sales data for each product 
+# * Products contains the product information
+# * To_predict has the products that need demand forecasting at quarterly level
+# 
+# ## 1.1 Load and overview of data
+
+# In[3]:
+
+
+# load data as dataframe
+sales_df = pd.read_csv("/Users/gege/Desktop/Yuki/study/project/demand forecasting/Historical_sales2.csv")
+product_df = pd.read_csv("/Users/gege/Desktop/Yuki/study/project/demand forecasting/Product2.csv")
+predict_df = pd.read_csv("/Users/gege/Desktop/Yuki/study/project/demand forecasting/Predicted_list2.csv")
+
+
+# In[4]:
+
+
+sales_df.head(5)
+
+
+# In[5]:
+
+
+product_df.head(5)
+
+
+# In[6]:
+
+
+predict_df.head(5)
+
+
+# In[7]:
+
+
+print(sales_df.shape, product_df.shape, predict_df.shape)
+
+
+# In[8]:
+
+
+sales_df.info()
+
+
+# In[9]:
+
+
+sales_df.describe()
+
+
+# In[10]:
+
+
+product_df.info()
+
+
+# In[11]:
+
+
+product_df.describe()
+
+
+# In[12]:
+
+
+predict_df.info()
+
+
+# In[13]:
+
+
+predict_df.describe()
+
+
+# In[14]:
+
+
+# check null value
+for i in [sales_df, product_df, predict_df]:
+    print(i.isnull().sum())  
+
+
+# In[15]:
+
+
+# check duplicates
+for i in [sales_df, product_df, predict_df]:
+    print(i.duplicated().sum())
+
+
+# In[16]:
+
+
+len(product_df.set_index("sku").index.get_duplicates())
+
+
+# In[17]:
+
+
+len(predict_df.set_index("sku").index.get_duplicates())
+
+
+# * There is nut null in the three tables
+# * There is no duplicates in product_df and predict_df, but there are 1808 duplicate values in sales_df and we need to deal with that in the processing part.
+
+# # 1.2 Carry_over product vs. new product
+#  Note: product is defined by sku as instructed
+# 
+# * carry_over product: products having a historical data (320)
+# * new product: products not having historical data (87)
+
+# In[18]:
+
+
+mask_co = predict_df["sku"].isin(sales_df["sku"])
+print("carry_over product:",mask_co.sum())
+mask_new = ~ mask_co  # ~ not
+print("new product:",mask_new.sum())
+
+
+# # 1.3 Join tables
+# * Join sales_df with reserve_df, and product_df. left join: only carry-over products
+# * new_product contains the product information of only new products
+
+# In[19]:
+
+
+# aggregate pos from weekly to quarterly
+#function1 = {'sales_amt':'sum', 'shelf_amt':'sum'}
+sales_quarterly = sales_df.groupby(['sku','location','quarter'], as_index = False).agg("sum")
+
+
+# In[20]:
+
+
+#之前的sales_df有duplicates， groupby之后没有duplicates
+sales_quarterly.duplicated().sum()
+
+
+# In[21]:
+
+
+# merge on leftjoin to get the table with products with history data
+co_combine = sales_quarterly.merge(product_df, on = ["sku"], how = "left")
+co_combine.head(5)
+
+
+# In[22]:
+
+
+# merge 后要检查new table是否有null
+print(co_combine.isnull().sum())
+
+
+# ### What to do if you have missing values? 2% missing, 10% missing, 50% missing?
+# 
+# * Simple approach: using average value, but this lacks the insights of distribution of missing values
+# * Alternative approach: using a regression/classification model to predict and fill the missing values - chosen
+
+# In[340]:
+
+
+a = product_df[predict_df["sku"].isin(sales_df["sku"])]
+a.shape
+
+
+# In[23]:
+
+
+new_product = product_df[~predict_df["sku"].isin(sales_df["sku"])]
+new_product.shape
+
+
+# # 1.4. Correlation analyses
+# * plot linear correlation among the features
+# * sales_amt is the target metric and not included
+
+# In[24]:
+
+
+corr = co_combine[["sales_amt", "shelf_amt", "sales_price"]].corr()
+corr
+
+
+# In[25]:
+
+
+sns.heatmap(corr, cmap = "YlGnBu")
+
+
+# We could see sales_amt has positive relationship with shelf_amt, while sales_price has negative relationships with sales_amt and shelf_amt.
+
+# In[26]:
+
+
+# categorical list without specs
+tmp_1 = ['location','quarter','brand','age','formation','family']
+# correlation of the categorical features 
+df_1 = co_combine[tmp_1]
+chi_square = pd.DataFrame(abs(np.random.randn(len(tmp_1),len(tmp_1))), columns= tmp_1, index = tmp_1)
+
+
+# In[27]:
+
+
+# cramer V statistics for correlation between categorical features
+def cramers_corrected_stat(confusion_matrix):
+    chi2 = ss.chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    phi2 = chi2/n
+    r,k = confusion_matrix.shape
+    phi2corr = max(0, phi2 - ((k-1)*(r-1))/(n-1))    
+    rcorr = r - ((r-1)**2)/(n-1)
+    kcorr = k - ((k-1)**2)/(n-1)
+    return np.sqrt(phi2corr / min( (kcorr-1), (rcorr-1)))
+# method 2, cramer's V = chi2/n*min((c-1)(r-1))
+#def cramers_corrected_stat1(confusion_matrix):
+#    chi2 = ss.chi2_contingency(confusion_matrix)[0]
+#    n = confusion_matrix.sum().sum()   
+#    r,k = confusion_matrix.shape   
+#    return np.sqrt(chi2/n * min( (k-1), (r-1)))
+
+
+# In[28]:
+
+
+for i in tmp_1:
+    tmp_list = [k for k in tmp_1 if k != i]
+    for j in tmp_list:
+        confusion_matrix = pd.crosstab(df_1[i], df_1[j])
+        val = cramers_corrected_stat(confusion_matrix)
+        chi_square[i][j] = float(val)
+        chi_square[i][i] = 1
+# chi_square is the cramer'V of all the categorical variables represents the correlations.
+chi_square
+
+
+# In[29]:
+
+
+sns.heatmap(chi_square, cmap = "YlOrRd")
+
+
+# # 1.5. Glance at columns
+# ## 1.5.1 Numerical data
+# See the variable itself and the relationship with y.
+
+# In[30]:
+
+
+co_combine[["sales_amt", "shelf_amt", "sales_price"]].describe(percentiles = [0.25, 0.5, 0.75, 0.95]).round(2)
+
+
+# In[31]:
+
+
+fig, ax1 = plt.subplots()
+ax1.hist(co_combine["sales_amt"], bins = range(0, 2000), color = "firebrick", alpha = 0.7, log = True, density = False)
+ax1.tick_params(labelcolor = "firebrick")
+ax2 = ax1.twinx()
+ax2.hist(co_combine["sales_amt"], bins = range(0, 2000), histtype = "step", color = "grey",cumulative = True, density = True)
+ax2.tick_params(labelcolor = "grey")
+plt.title("Histogram of sales_amt")
+plt.show()
+
+
+# In[32]:
+
+
+fig, ax1 = plt.subplots()
+ax1.hist(co_combine["shelf_amt"], bins = range(0, 20000), color = "blue", alpha = 0.7, log = True, density = False)
+ax1.tick_params(labelcolor = "blue")
+ax2 = ax1.twinx()
+ax2.hist(co_combine["shelf_amt"], bins = range(0, 20000), histtype = "step", color = "grey",cumulative = True, density = True)
+ax2.tick_params(labelcolor = "grey")
+plt.title("Histogram of shelf_amt")
+plt.show()
+
+
+# In[33]:
+
+
+fig, ax1 = plt.subplots()
+ax1.hist(co_combine["sales_price"], bins = range(0, 350), color = "green", alpha = 0.7, log = False, density = False)
+ax1.tick_params(labelcolor = "blue")
+ax2 = ax1.twinx()
+ax2.hist(co_combine["sales_price"], bins = range(0, 350), histtype = "step", color = "grey",cumulative = True, density = True)
+ax2.tick_params(labelcolor = "grey")
+plt.title("Histogram of sales_price")
+plt.show()
+
+
+# In[34]:
+
+
+sns.regplot(co_combine["sales_price"], co_combine["sales_amt"], label = "sales_price", marker = "+", line_kws = {"color":"red"})
+plt.legend(loc = "upper right")
+plt.show()
+
+
+# In[35]:
+
+
+sns.regplot(co_combine["shelf_amt"], co_combine["sales_amt"], line_kws = {"color":"red"}, label ="shelf_amt" )
+plt.legend(loc = "lower right")
+plt.show()
+
+
+# # 1.5.2 Categorical data
+# * count of each category
+# * correlation between categorical feature with sales
+
+# In[36]:
+
+
+for i in ['location','quarter','brand','age','formation','family']:
+    sns.countplot(i, data = co_combine)
+    plt.xticks(rotation = 90)
+    plt.title("Count of {}".format(i))
+    plt.show()
+    sns.stripplot(i, "sales_amt", data = co_combine, jitter = True)
+    plt.title("{} VS Sales_amt".format(i))
+    plt.xticks(rotation = 90)
+    plt.show()
+
+
+# # 2. Feature processing
+# ## 2.1 Extra features
+# * Extra Season and Year out of quarter
+# * Count # patents in a product
+
+# In[63]:
+
+
+# split quarter into season and year, count number of specs
+co_combine1 = co_combine.copy(deep = True)
+co_combine1["season"] = co_combine1["quarter"].astype(str).str[0:2]
+co_combine1["year"] = co_combine1["quarter"].str[2:6]
+co_combine1["num_specs"] = co_combine1['specs'].str.split("|").str.len()
+#co_combine1.drop(["quarter","specs"], axis = 1, inplace = True)
+#co_combine1.head(5)
+
+# treat specs in the same way in the new product
+new_product1 = new_product.copy(deep = True)
+new_product1["num_specs"] = new_product1["specs"].str.split("|").str.len()
+
+
+# In[64]:
+
+
+co_combine1.head(5)
+
+
+# ## 2.2 Bucktize and scaling
+# * bucktize sales_price
+# * scale numerical features
+
+# In[65]:
+
+
+co_combine1["sales_price"].describe(percentiles = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1])
+
+
+# In[66]:
+
+
+'''
+price = [0, 30, 60, 90, 120, 150, 306]
+price_range = ["price_$0-30", "price_$30-60", "price_$60-90", "price_$90-120", "price_$120-150", "price_>$150"]
+price_bin = pd.cut(co_combine1["sales_price"], price, labels = price_range)
+price_seg = pd.get_dummies(price_bin).astype(np.int)
+co_combine1 = pd.concat([co_combine1, price_seg], axis = 1)
+co_combine1.drop(["sales_price"], axis = 1, inplace = True)
+'''
+
+
+# In[67]:
+
+
+co_combine1.head(5)
+
+
+# In[68]:
+
+
+'''
+new_product_bin = pd.cut(new_product1["sales_price"], price, labels = price_range)
+new_product_seg = pd.get_dummies(new_product_bin).astype(np.int)
+new_product1 = pd.concat([new_product1, new_product_seg], axis = 1)
+new_product1.head(5)
+'''
+
+
+# In[69]:
+
+
+# robust scaling (rubst to outliers) to numerical variables
+co_combine2 = co_combine1.copy(deep = True)
+scale_lst = ["sales_amt", "shelf_amt", "sales_price"]
+scale = preprocessing.RobustScaler().fit(co_combine2[scale_lst])
+co_combine2[scale_lst] = scale.transform(co_combine2[scale_lst])
+
+
+# In[70]:
+
+
+# dummies categorical variables
+cate_lst = ['location','brand','age','formation','family','num_specs','season','year']
+co_combine2 = pd.get_dummies(co_combine2, columns = cate_lst, drop_first=True) 
+co_combine2.head(5)
+
+
+# # 3. Modeling
+# * Two models will be developed: one for carry-over products; one for new products
+# * The carry over model will be training on only its own historical data
+# * The new model will be training on the data based on similarity with the history products
+
+# ## 3.1. Carry-over product model
+# * Use data of each product to build numerous models is not ideal, the average data point of each product/sku is 22, it is too little to build a good model
+# * Traditional method such as ARIMA could be used, but it lacks the 'insight' of products inner corrleation
+# * Build a complicated model using more products is a better option
+# * Target metric y = sales_amt
+# * SP2016 data is used to evaluate the model
+
+# In[71]:
+
+
+# goup by sku, count the num of each sku, calculate the mean
+co_combine2.groupby("sku").agg({"sku":"count"}).mean()
+# mean is 22, and each sku has different number of iterms, it is hard to build a model for each product.
+
+
+# In[72]:
+
+
+# this dataset is special, we do not need to split train and test randomly, we just use a part 
+# of data(latest) as test data.
+print(max(co_combine1["year"]))
+a = co_combine1[co_combine1["year"] == "2016"]
+a.shape
+a[a["season"] == "SP"].shape
+
+
+# ### 3.1.1 Train/test split
+
+# In[73]:
+
+
+co_combine2_test = co_combine2[co_combine2["quarter"] == "SP2016"]
+co_combine2_train = co_combine2[co_combine2["quarter"] != "SP2016"]
+#co_combine2_test.shape
+co_combine2_train.shape
+
+
+# In[74]:
+
+
+co_combine2_test.head(2)
+
+
+# In[75]:
+
+
+co_combine2_train = shuffle(co_combine2_train)
+co_combine2_train_x = co_combine2_train.drop(["sku", "quarter", "specs", "sales_amt"], axis = 1)
+co_combine2_train_y = co_combine2_train["sales_amt"]
+
+co_combine2_test_x = co_combine2_test.drop(["sku", "quarter", "specs", "sales_amt"], axis = 1)
+co_combine2_test_y = co_combine2_test["sales_amt"]
+
+
+# ### 3.1.2 Quick linear model for baseline
+# * Use Lasso regression for quick baseline
+# * Mean absolute percentage error (MAPE), mean absolute error (MAE), and the ratio Mean    absolute deviation (MAD) are used as evaluation metric
+
+# In[76]:
+
+
+lasso = Lasso()
+alphas = np.logspace(-0.8, 1.3, num = 50)
+scores = np.empty_like(alphas)
+opt_a = float("-inf")
+max_score = float("-inf")
+for i, a in enumerate(alphas):
+    lasso.set_params(alpha = a)
+    lasso.fit(co_combine2_train_x, co_combine2_train_y)
+    scores[i] = lasso.score(co_combine2_test_x, co_combine2_test_y)
+    if scores[i] > max_score:
+        max_score = scores[i]
+        opt_a = a
+        lasso_save = lasso
+
+
+# In[77]:
+
+
+lasso.get_params()
+
+
+# In[78]:
+
+
+plt.plot(alphas, scores, color = "b", linestyle = "dashed", marker = "o")
+plt.xlabel("alphas")
+plt.ylabel("sacores")
+plt.grid(True)
+plt.title("score vs. alpha")
+plt.show()
+
+
+# In[79]:
+
+
+print(opt_a, max_score)
+
+
+# In[80]:
+
+
+# The final optimal lasso
+lasso_f = Lasso(alpha = opt_a)
+lasso_f.fit(co_combine2_train_x, co_combine2_train_y)
+
+
+# In[81]:
+
+
+# predict test
+lasso_pred = lasso_f.predict(co_combine2_test_x)
+lasso_pred
+
+
+# In[82]:
+
+
+# If we treat sales_price, num_specs as numerical features, the result is almost the same.
+
+
+# In[83]:
+
+
+co_test_lasso = co_combine2_test.copy(deep = True)
+co_test_lasso["pred"] = np.round(lasso_pred, 2)
+co_test_lasso["pred"] = co_test_lasso["pred"].clip(lower = 0)
+co_test_lasso_agg = co_test_lasso.groupby(["sku"]).agg({"sales_amt":"sum", "pred": "sum"})
+co_test_lasso_agg.head(2)
+
+
+# In[270]:
+
+
+# define MAPE and MAD_ratio, and evalution result
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred)/(y_true+1)))*100
+
+def mean_absolute_deviation_ratio(y_true, y_pred):
+    return y_pred.mad()/(y_true.mad()+0.1)
+
+def evaluate(result_agg):
+    MAPE = mean_absolute_percentage_error(result_agg["sales_amt"], result_agg["pred"])
+    print("MAPE of prediction in SP2016 is {}".format(MAPE))
+    MAE = mean_absolute_error(result_agg["sales_amt"], result_agg["pred"])
+    print("MAE of prediction in SP2016 is {}".format(MAE))
+    MAD = mean_absolute_deviation_ratio(result_agg["sales_amt"], result_agg["pred"])
+    print("MAD of prediction in SP2016 is {}".format(MAD))
+
+def plot_diff(result_agg, title1, title2):
+    plt.plot(result_agg["pred"], "o", color = "red", alpha = 0.5)
+    plt.plot(result_agg["sales_amt"], "*", color = "blue", alpha = 0.5)
+    plt.title(title1)
+    plt.legend(loc = "upper left")
+    plt.show()
+    
+    plt.plot(result_agg["pred"] - result_agg["sales_amt"], "v", color = "green")
+    plt.title(title2)
+    plt.show()
+
+
+# In[271]:
+
+
+evaluate(co_test_lasso)
+
+
+# In[272]:
+
+
+evaluate(co_test_lasso_agg)
+
+
+# In[273]:
+
+
+plot_diff(co_test_lasso_agg, 'Pred vs. Actual in Lasso', 'Difference between pred and acutal')
+
+
+# In[275]:
+
+
+grid_1 = {"n_estimators": [35, 40, 45, 50, 55],
+         "max_depth": [20, 30, 35, 40]}
+rf_1 = RandomForestRegressor(random_state = 2019, verbose = 1, n_jobs = 6)
+rf_1_grid = GridSearchCV(rf_1, grid_1, cv = 5)
+rf_1_grid.fit(co_combine2_train_x, co_combine2_train_y)
+
+
+# In[276]:
+
+
+scores = rf_1_grid.cv_results_["mean_test_score"]
+n_est = [35, 40, 45, 50, 55]
+m_depth = [20, 30, 35, 40]
+scores = np.array(scores).reshape(len(m_depth), len(n_est))
+plt.figure()
+plt.subplot(111)
+for i, a in enumerate(m_depth):
+    plt.plot(n_est, scores[i], marker = "o", label = "max_depth" + str(a))
+plt.title("RF_CV_search")
+plt.legend(loc = "lower right")
+plt.xlabel("N estimator")
+plt.ylabel("mean score")
+plt.show()
+
+
+# In[277]:
+
+
+print(rf_1_grid.best_params_)
+print(rf_1_grid.best_score_)
+
+
+# In[278]:
+
+
+rf_best = rf_1_grid.best_estimator_
+rf_best.fit(co_combine2_train_x, co_combine2_train_y)
+rf_test_pred = rf_best.predict(co_combine2_test_x)
+rf_test_pred
+
+
+# In[279]:
+
+
+co_test_rf = co_combine2_test.copy(deep = True)
+co_test_rf["pred"] = np.round(rf_test_pred)
+co_test_rf["pred"] = co_test_rf["pred"].clip(lower = 0)
+
+
+# In[280]:
+
+
+evaluate(co_test_rf)
+
+
+# In[281]:
+
+
+co_test_rf_agg = co_test_rf.groupby("sku").agg({"sales_amt":"sum", "pred":"sum"})
+co_test_rf_agg.head(2)
+
+
+# In[282]:
+
+
+evaluate(co_test_rf_agg)
+
+
+# In[97]:
+
+
+plot_diff(co_test_rf, 'Pred vs. Actual in RF', 'Difference between pred and acutal')
+
+
+# In[98]:
+
+
+plot_diff(co_test_rf_agg, 'Pred vs. Actual in RF', 'Difference between pred and acutal')
+
+
+# In[99]:
+
+
+importance_rf_best = rf_best.feature_importances_
+feature_name = co_combine2_train_x.columns.tolist()
+df_importantce_rf_best = pd.DataFrame({"Feature":feature_name, "Importance":importance_rf_best})
+rank_importance_rf_best = df_importantce_rf_best.sort_values("Importance", ascending = False)
+rank_importance_rf_best.head(2)
+
+
+# In[100]:
+
+
+# feature importance
+def plot_feature_importance(rank_importance,left_limit, color, alpha, size_L, size_H, title):
+    fig, ax = plt.subplots(1,1) 
+    ax.bar(range(len(rank_importance['Feature'][0:left_limit])),rank_importance[0:left_limit]['Importance'],color=color, alpha=alpha)
+    ax.set_xticks(range(rank_importance[0:left_limit].shape[0]))
+    ax.set_xticklabels(rank_importance[0:left_limit]['Feature'], rotation='vertical', fontsize=12)    
+    ax.set_xlabel('Features', fontsize = 16)
+    ax.set_ylabel('Feature importance', fontsize = 16)
+    ax.set_title(title, fontsize = 16)
+    fig.set_size_inches(size_L, size_H)
+    plt.show()
+
+
+# In[101]:
+
+
+plot_feature_importance(rank_importance_rf_best,15, 'steelblue', 0.8, 16, 6, 'Feature importance')
+
+
+# In[102]:
+
+
+# get the raw features importance (aggregate all dummies)
+def raw_feature_importance(importance_dataframe, cate_list):
+    # numercial feature importance
+    numerical_importance = importance_dataframe[importance_dataframe["Feature"].isin(["shelf_amt", "sales_price"])]
+    numerical_importance.reset_index(drop = True, inplace = True)
+
+    cate_dict ={}
+    for i in cate_list:
+        summ = 0
+        for (idx, row) in importance_dataframe.iterrows():
+            if i in row.loc['Feature']:
+                summ += row.loc['Importance']
+        cate_dict[i] = summ 
+        
+    
+    cate_importance = pd.DataFrame.from_dict(cate_dict, orient='index')
+    cate_importance.rename(columns={0: 'Importance'}, inplace=True)
+    cate_importance.reset_index(inplace = True)
+    cate_importance.rename(index=str, columns={"index": "Feature"}, inplace = True)
+
+    raw_feature_importances = pd.concat([numerical_importance, cate_importance])
+    #raw_feature_importances.sort_values(by = ['Importance'], ascending = False)
+    return raw_feature_importances
+
+
+# In[103]:
+
+
+#rank_importance_rf_best[rank_importance_rf_best["Feature"].isin(["shelf_amt", "sales_price"])]
+
+
+# In[104]:
+
+
+raw_feature_importances = raw_feature_importance(df_importantce_rf_best, cate_lst)
+
+
+# In[105]:
+
+
+sort_raw_feature = raw_feature_importances.sort_values(by = ["Importance"], ascending = False)
+sort_raw_feature
+
+
+# In[106]:
+
+
+plot_feature_importance(sort_raw_feature, 10, "red", 0.8, 10, 6, "Importance of Ctaegorical features")
+
+
+# ## 3.2 New product model
+# * The product is new and has not been sold before.
+# * Find a group of old products similiar to the new product, train a model on them, and use this model for prediction
+# * Clustering could be another method, number of clusters can be a hyper-parameter
+
+# ### 3.2.1 Similar product search¶
+# * Analyze the cosine similarity bewteen 87 new products in new_product_1 and 320 products in co_combine_1 with full historical data
+# * For each new product, the top 3 most similar old products are chosen
+# * Then use the data of these chosen carry-over products to train a model, which can predict demand of new products
+# * First we choose those similar products ID by cosine value, then select products from the history data with those ID, and use them to train and test a model.
+
+# In[341]:
+
+
+co_combine1.head(2)
+
+
+# In[286]:
+
+
+new_product1.head(2)
+
+
+# In[288]:
+
+
+similarity_prod = co_combine1[["sku", "brand", "age", "formation", "family", "sales_price", "num_specs"]]
+cate_similarity = ["brand", "age", "formation", "family"]
+similarity_prod_dummy = pd.get_dummies(similarity_prod, columns = cate_similarity, drop_first = True)
+similarity_prod_dummy.duplicated().sum()
+
+
+# In[289]:
+
+
+similarity_prod_dummy.drop_duplicates(inplace = True)
+similarity_prod_dummy.head(2)
+
+
+# In[290]:
+
+
+# this is is later ID mapping
+prod_ID = similarity_prod_dummy['sku']
+
+
+# In[292]:
+
+
+s_lst = similarity_prod_dummy.drop(['sku'],axis=1).values.tolist()
+len(s_lst)
+
+
+# In[293]:
+
+
+new_product2 = new_product1.drop(["specs"], axis = 1)
+new_prod_dummy = pd.get_dummies(new_product2, columns = cate_similarity, drop_first = True)
+new_prod_dummy.head(2)
+
+
+# In[294]:
+
+
+# change set to list
+drop_set = set(new_prod_dummy.columns) - set(similarity_prod_dummy.columns)
+diff_sim = list(drop_set)
+
+# delete the columns that not in history data
+if diff_sim != 0:
+    new_prod_dummy.drop(diff_sim, axis = 1, inplace = True) 
+
+
+# In[295]:
+
+
+new_prod_dummy.head(2)
+
+
+# In[296]:
+
+
+missing_cols_sim = set(similarity_prod_dummy.columns) - set(new_prod_dummy.columns)
+
+# Add a missing column in test set with default value equal to 0
+for m in missing_cols_sim:
+    new_prod_dummy[m] = 0
+
+
+# In[297]:
+
+
+new_prod_dummy.head(2)
+
+
+# New product table has the same columns with history product. Then we make the features in the same order
+
+# In[298]:
+
+
+new_prod_dummy = new_prod_dummy[similarity_prod_dummy.columns]
+
+
+# In[299]:
+
+
+# check duplicates, if there is duplicate, we need to get unique rows to drop duplicates.
+new_prod_dummy.duplicated().sum()
+#new_prod_dummy.drop_duplicates()
+
+
+# In[300]:
+
+
+new_prod_ID = new_prod_dummy["sku"]
+
+
+# In[301]:
+
+
+s_new = new_prod_dummy.drop(["sku"], axis = 1)
+new = similarity_prod_dummy.drop(['sku'],axis=1)
+
+
+# In[302]:
+
+
+print(new.shape)
+print(s_new.shape)
+
+
+# In[303]:
+
+
+# dataframe.values, only values will be returned
+s_new_list = s_new.values.tolist()
+len(s_new_list)
+
+
+# In[304]:
+
+
+d_sim = defaultdict(list)
+for i in range(len(new_prod_ID)):
+    for j in range(len(prod_ID)):
+        s_new_list[i] = np.array(s_new_list[i]).reshape(1, -1)
+        s_lst[j] = np.array(s_lst[j]).reshape(1, -1)
+        tmp_sim = float(cosine_similarity(s_new_list[i], s_lst[j]))
+        d_sim[i].append(tmp_sim)
+
+
+# In[305]:
+
+
+# get the top 3 most similar products list with each new product
+high_sim_prod_index = set()
+for ID in range(87):
+    tmp_3 = sorted(range(320), key=lambda i: d_sim[ID][i])[-3:]
+    for p in tmp_3:
+        high_sim_prod_index.add(p)
+        
+high_sim_prod_ID = prod_ID.iloc[list(high_sim_prod_index)]
+
+
+# In[307]:
+
+
+# choose the similar products from the history data
+similarity_new1 = co_combine1[co_combine1["sku"].isin(high_sim_prod_ID)]
+print(similarity_new1.shape)
+
+
+# In[308]:
+
+
+similarity_new1.head(2)
+
+
+# In[312]:
+
+
+cate_lst_new = ["location", "brand", "age", "formation", "family", "season", "year"]
+
+
+# In[313]:
+
+
+similarity_new2 = pd.get_dummies(similarity_new1, columns = cate_lst_new, drop_first = True)
+
+
+# In[315]:
+
+
+similarity_new2.head(2)
+
+
+# In[342]:
+
+
+# split train and test
+similarity_new2_test = similarity_new2[similarity_new2["quarter"] == "SP2016"]
+similarity_new2_train = similarity_new2[similarity_new2["quarter"] != "SP2016"]
+
+similarity_new2_train = shuffle(similarity_new2_train)
+similarity_new2_train_X = similarity_new2_train.drop(["sku", "quarter", "sales_amt", "specs"], axis = 1)
+similarity_new2_train_y = similarity_new2_train["sales_amt"]
+
+similarity_new2_test_X = similarity_new2_test.drop(["sku", "quarter", "sales_amt", "specs"], axis = 1)
+similarity_new2_test_y = similarity_new2_test["sales_amt"]
+
+
+# ### 3.2.3 Random forest model
+
+# In[346]:
+
+
+grid_2 = {'n_estimators': [5,10,20,30,40,50,60],
+          'max_depth': [30,40,50,60,70]}
+
+rf_2 = RandomForestRegressor(random_state=2019, verbose=1, n_jobs = 6)
+grid_rf_2 = GridSearchCV(rf_2, grid_2, cv=3)
+grid_rf_2.fit(similarity_new2_train_X, similarity_new2_train_y)
+
+
+# In[348]:
+
+
+scores = grid_rf_2.cv_results_["mean_test_score"]
+n_est = [5,10,20,30,40,50,60]
+m_depth = [30,40,50,60,70]
+scores = np.array(scores).reshape(len(m_depth), len(n_est))
+plt.figure()
+plt.subplot(111)
+for i, a in enumerate(m_depth):
+    plt.plot(n_est, scores[i], marker = "o", label = "max_depth" + str(a))
+plt.title("RF_new_CV_search")
+plt.legend(loc = "lower right")
+plt.xlabel("N estimator")
+plt.ylabel("Mean score")
+plt.show()
+
+
+# In[349]:
+
+
+print(grid_rf_2.best_params_)
+print(grid_rf_2.best_score_)
+
+
+# In[350]:
+
+
+# the model with best parameters
+rf_best_new = grid_rf_2.best_estimator_
+rf_best_new.fit(similarity_new2_train_X, similarity_new2_train_y)
+
+
+# In[351]:
+
+
+test_pred = rf_best_new.predict(similarity_new2_test_X)
+test_pred
+
+
+# In[352]:
+
+
+new_test_rf = similarity_new2_test.copy(deep = True)
+new_test_rf["pred"] = np.round(test_pred)
+new_test_rf["pred"] = new_test_rf["pred"].clip(lower = 0)
+
+
+# In[353]:
+
+
+new_test_rf_agg = new_test_rf.groupby("sku").agg({'sales_amt':'sum', 'pred':'sum'})
+
+
+# In[354]:
+
+
+evaluate(new_test_rf)
+
+
+# In[355]:
+
+
+evaluate(new_test_rf_agg)
+
+
+# In[356]:
+
+
+plot_diff(new_test_rf,'Pred vs. Actual in RF_new', 'Difference between pred and acutal')
+
